@@ -474,4 +474,69 @@ mod tests {
         assert!(!report.files[0].backed_up);
         assert!(!dir.path().join("f.orig").exists());
     }
+
+    #[test]
+    fn patches_a_file_in_a_subdirectory() {
+        let patch = b"--- a/sub/f\n+++ b/sub/f\n@@ -1,1 +1,1 @@\n-old\n+new\n";
+        let dir = tree(&[]);
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/f"), b"old\n").unwrap();
+        let report = apply_to_tree(dir.path(), &[parse(patch)], &opts(), None).unwrap();
+        assert!(report.is_success());
+        assert_eq!(std::fs::read(dir.path().join("sub/f")).unwrap(), b"new\n");
+    }
+
+    #[test]
+    fn creates_a_file_from_dev_null() {
+        let patch = b"--- /dev/null\n+++ b/new\n@@ -0,0 +1,1 @@\n+hello\n";
+        let dir = tree(&[]);
+        let report = apply_to_tree(dir.path(), &[parse(patch)], &opts(), None).unwrap();
+        assert!(report.is_success());
+        assert_eq!(std::fs::read(dir.path().join("new")).unwrap(), b"hello\n");
+    }
+
+    #[test]
+    fn refuses_a_path_outside_the_tree() {
+        let dir = tree(&[]);
+        for name in ["../x", "/x"] {
+            let patch = format!("--- {name}\n+++ {name}\n@@ -1,1 +1,1 @@\n-old\n+new\n");
+            let result = apply_one(
+                dir.path(),
+                &parse(patch.as_bytes()),
+                &Default::default(),
+                &mut None,
+            );
+            assert!(matches!(result, Err(Error::Malformed(_))), "{name}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_a_symlink_out_of_the_tree() {
+        let outside = tree(&[("file", b"old\n")]);
+        let dir = tree(&[]);
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("a")).unwrap();
+        let patch = b"--- a/a/file\n+++ b/a/file\n@@ -1,1 +1,1 @@\n-old\n+new\n";
+        let result = apply_to_tree(dir.path(), &[parse(patch)], &opts(), None);
+        assert!(matches!(result, Err(Error::Malformed(_))));
+        assert_eq!(
+            std::fs::read(outside.path().join("file")).unwrap(),
+            b"old\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn leaves_a_hard_link_out_of_the_tree_alone() {
+        let outside = tree(&[("file", b"old\n")]);
+        let dir = tree(&[]);
+        std::fs::hard_link(outside.path().join("file"), dir.path().join("file")).unwrap();
+        let patch = b"--- a/file\n+++ b/file\n@@ -1,1 +1,1 @@\n-old\n+new\n";
+        apply_to_tree(dir.path(), &[parse(patch)], &opts(), None).unwrap();
+        assert_eq!(std::fs::read(dir.path().join("file")).unwrap(), b"new\n");
+        assert_eq!(
+            std::fs::read(outside.path().join("file")).unwrap(),
+            b"old\n"
+        );
+    }
 }
