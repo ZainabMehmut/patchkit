@@ -13,7 +13,7 @@
 use crate::apply::{apply_fuzzy, ApplyOptions, HunkOutcome};
 use crate::unified::UnifiedPatch;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Options for applying a patch set to files on disk.
 #[derive(Debug, Clone)]
@@ -55,13 +55,16 @@ impl Default for ApplyToTreeOptions {
 }
 
 /// Something went wrong applying a patch set. A failed *hunk* is not an error; it
-/// is recorded in the [`FileReport`]. This is reserved for I/O failures and
-/// patches that name no file to write.
+/// is recorded in the [`FileReport`]. This is reserved for I/O failures,
+/// patches that name no file to write, and patches naming a path that is not a
+/// plain relative path or that leads out of the tree.
 #[derive(Debug)]
 pub enum Error {
     /// An I/O error touching the tree.
     Io(std::io::Error),
-    /// A patch that names `/dev/null` on both sides, so there is nothing to do.
+    /// A patch that cannot be applied as written, because it names `/dev/null`
+    /// on both sides or names a path that is not a plain relative path or leads
+    /// out of the tree.
     Malformed(String),
 }
 
@@ -163,6 +166,51 @@ fn strip_path(name: &[u8], strip: u32) -> PathBuf {
     PathBuf::from(name.splitn(strip as usize + 1, '/').last().unwrap_or(name))
 }
 
+/// Reject a patch path that is empty or has any component other than an
+/// ordinary name or `.`, so a patch cannot point out of the tree with `..`, a
+/// leading slash or a Windows prefix. Components split the way the host does,
+/// so `..\x` is one plain name on Unix and is refused on Windows.
+fn check_contained(name: &Path) -> Result<(), Error> {
+    if name.as_os_str().is_empty()
+        || name
+            .components()
+            .any(|c| !matches!(c, Component::Normal(_) | Component::CurDir))
+    {
+        return Err(Error::Malformed(format!(
+            "patch path is not a plain relative path: {}",
+            name.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Join `name` to the canonical `root`, refusing a path that is a symlink or
+/// whose deepest existing directory resolves outside `root`.
+fn resolve(root: &Path, name: &Path) -> Result<PathBuf, Error> {
+    let path = root.join(name);
+    if path
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink())
+    {
+        return Err(Error::Malformed(format!(
+            "patch path is a symlink: {}",
+            name.display()
+        )));
+    }
+    let existing = path
+        .ancestors()
+        .skip(1)
+        .find(|p| p.symlink_metadata().is_ok())
+        .unwrap_or(root);
+    if !existing.canonicalize()?.starts_with(root) {
+        return Err(Error::Malformed(format!(
+            "patch path leaves the tree through a symlink: {}",
+            name.display()
+        )));
+    }
+    Ok(path)
+}
+
 fn is_dev_null(name: &[u8]) -> bool {
     let name = String::from_utf8_lossy(name);
     name.split('\t').next().unwrap_or(&name) == "/dev/null"
@@ -176,11 +224,18 @@ fn apply_one(
 ) -> Result<FileReport, Error> {
     let (orig, modified) = target_of(patch, options.strip);
 
+    for name in [orig.as_deref(), modified.as_deref()].into_iter().flatten() {
+        check_contained(name)?;
+    }
+
     let read_from = orig
         .as_ref()
         .or(modified.as_ref())
         .ok_or_else(|| Error::Malformed("patch names /dev/null on both sides".to_string()))?;
-    let path = directory.join(read_from);
+    let write_to = modified.as_ref().unwrap_or(read_from);
+    let root = directory.canonicalize()?;
+    let path = resolve(&root, read_from)?;
+    let dest = resolve(&root, write_to)?;
 
     let original = match std::fs::read(&path) {
         Ok(content) => content,
@@ -206,7 +261,7 @@ fn apply_one(
     let mut backed_up = false;
     if !clean && !options.dry_run {
         if let Some(suffix) = &options.backup_suffix {
-            std::fs::write(with_suffix(&path, suffix), &original)?;
+            replace_file(&resolve(&root, &with_suffix(read_from, suffix))?, &original)?;
             backed_up = true;
         }
     }
@@ -244,9 +299,6 @@ fn apply_one(
         .partial
         .expect("apply_fuzzy yields content outside a dry run");
 
-    let write_to = modified.as_ref().unwrap_or(read_from);
-    let dest = directory.join(write_to);
-
     // A file only goes away if the patch that empties it actually applied.
     if applied_cleanly && (modified.is_none() || (options.remove_empty_files && patched.is_empty()))
     {
@@ -264,7 +316,7 @@ fn apply_one(
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&dest, &patched)?;
+    replace_file(&dest, &patched)?;
     if dest != path && orig.is_some() {
         std::fs::remove_file(&path)?;
     }
@@ -276,6 +328,24 @@ fn apply_one(
         removed: false,
         backed_up,
     })
+}
+
+/// Write `data` to a new file and rename it over `path`, so a hard link to `path`
+/// from outside the tree keeps its old content.
+fn replace_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let tmp = with_suffix(path, ".patchkit-new");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)?;
+    let result = std::fs::metadata(path)
+        .map_or(Ok(()), |meta| file.set_permissions(meta.permissions()))
+        .and_then(|()| file.write_all(data))
+        .and_then(|()| std::fs::rename(&tmp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// Append `suffix` to a path's file name, rather than replacing its extension.
